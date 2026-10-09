@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TOTP Token Generator</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f172a; --card:#1e293b; --accent:#22d3ee; --text:#e2e8f0; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:#020617; color:var(--text); display:flex; align-items:center; justify-content:center; min-height:100vh; padding:20px; }
+  .card { background:var(--card); border:1px solid #334155; border-radius:16px; padding:28px; width:100%; max-width:480px; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+  h1 { margin:0 0 6px; font-size:22px; }
+  p.sub { margin:0 0 20px; color:#94a3b8; font-size:14px; }
+  label { font-size:13px; color:#94a3b8; display:block; margin:14px 0 6px; }
+  input, select { width:100%; padding:12px; border-radius:10px; border:1px solid #334155; background:#0f172a; color:var(--text); font-size:15px; outline:none; }
+  input:focus { border-color:var(--accent); }
+  input.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing:.5px; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+  .otp-box { text-align:center; margin:22px 0 10px; padding:20px; background:#020617; border:1px dashed #334155; border-radius:12px; }
+  .otp { font-family: ui-monospace, Menlo, monospace; font-size:48px; font-weight:800; letter-spacing:8px; color:var(--accent); margin:0; min-height:58px; }
+  .timer-wrap { height:6px; background:#334155; border-radius:99px; overflow:hidden; margin-top:14px; }
+  #timerBar { height:100%; background:var(--accent); width:100%; transition:width 1s linear; }
+  .meta { display:flex; justify-content:space-between; font-size:13px; color:#94a3b8; margin-top:8px; }
+  .btns { display:flex; gap:10px; margin-top:18px; }
+  button { flex:1; padding:12px; border-radius:10px; border:0; font-size:15px; font-weight:600; cursor:pointer; }
+  .primary { background:var(--accent); color:#020617; }
+  .secondary { background:#334155; color:white; }
+  button:hover { opacity:.9; }
+  .error { color:#f87171; font-size:13px; margin-top:8px; min-height:18px; }
+  code.url { display:block; background:#020617; padding:10px; border-radius:8px; font-size:12px; color:#94a3b8; margin-top:12px; word-break:break-all; border:1px solid #1e293b; }
+  a { color:var(--accent); }
+  .share { margin-top:14px; font-size:13px; color:#94a3b8; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🔑 TOTP Token Generator</h1>
+  <p class="sub">Paste your Base32 secret key to get the current OTP. Auto-refreshes every 30s.</p>
+
+  <label for="secret">Secret Key (Base32)</label>
+  <input id="secret" class="mono" placeholder="JBSW Y3DP EHPK 3PXP" autocomplete="off" spellcheck="false" />
+
+  <div class="row">
+    <div>
+      <label for="digits">Digits</label>
+      <select id="digits"><option value="6" selected>6</option><option value="8">8</option></select>
+    </div>
+    <div>
+      <label for="period">Period (sec)</label>
+      <select id="period"><option value="30" selected>30</option><option value="60">60</option></select>
+    </div>
+    <div>
+      <label for="algo">Algorithm</label>
+      <select id="algo"><option value="SHA-1" selected>SHA-1</option><option value="SHA-256">SHA-256</option><option value="SHA-512">SHA-512</option></select>
+    </div>
+  </div>
+
+  <div class="otp-box">
+    <p class="otp" id="otp">------</p>
+    <div class="timer-wrap"><div id="timerBar"></div></div>
+    <div class="meta"><span id="countdown">--s</span><span id="epoch">--</span></div>
+  </div>
+  <div class="error" id="error"></div>
+
+  <div class="btns">
+    <button class="primary" id="genBtn">Generate</button>
+    <button class="secondary" id="copyBtn">Copy OTP</button>
+  </div>
+
+  <div class="share">
+    Direct link retrieval: append <b>?secret_key=YOURSECRET</b> to the URL.<br/>
+    Example:
+    <code class="url" id="exampleUrl">?secret_key=JBSWY3DPEHPK3PXP</code>
+    <span id="plainNote" style="display:none">Plain-text mode: add <b>&plain=1</b> to output only the OTP (for scripts / direct retrieval).</span>
+  </div>
+</div>
+
+<script>
+// ---------- Base32 decode ----------
+function base32Decode(str) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = str.trim().replace(/[\s\-_]/g, '').replace(/=+$/, '').toUpperCase();
+  if (!clean) throw new Error('Secret is empty');
+  if (!/^[A-Z2-7]+$/.test(clean)) throw new Error('Invalid Base32 secret (A-Z, 2-7 only)');
+  let bits = '', bytes = [];
+  for (const c of clean) {
+    const v = alphabet.indexOf(c);
+    bits += v.toString(2).padStart(5, '0');
+  }
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  }
+  return new Uint8Array(bytes);
+}
+
+// ---------- TOTP (RFC 6238) ----------
+async function generateTOTP(secretB32, timeStep, digits, algorithm) {
+  const keyBytes = base32Decode(secretB32);
+  const counter = Math.floor(Date.now() / 1000 / timeStep);
+  const msg = new ArrayBuffer(8);
+  const view = new DataView(msg);
+  // 64-bit big-endian counter (high 32 = 0 for current epoch range)
+  view.setUint32(0, Math.floor(counter / 0x100000000));
+  view.setUint32(4, counter >>> 0);
+
+  const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: algorithm }, false, ['sign']);
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', cryptoKey, msg));
+  const offset = sig[sig.length - 1] & 0x0f;
+  const code = ((sig[offset] & 0x7f) << 24) | (sig[offset + 1] << 16) | (sig[offset + 2] << 8) | sig[offset + 3];
+  return { otp: String(code % Math.pow(10, digits)).padStart(digits, '0'), counter };
+}
+
+const $ = id => document.getElementById(id);
+const secretEl = $('secret'), digitsEl = $('digits'), periodEl = $('period'), algoEl = $('algo');
+const otpEl = $('otp'), errEl = $('error'), barEl = $('timerBar'), cdEl = $('countdown'), epochEl = $('epoch');
+
+async function refresh(manual) {
+  const secret = secretEl.value;
+  errEl.textContent = '';
+  if (!secret.trim()) { otpEl.textContent = '------'; if (manual) errEl.textContent = 'Paste a secret key first.'; return; }
+  try {
+    const period = parseInt(periodEl.value, 10);
+    const digits = parseInt(digitsEl.value, 10);
+    const { otp } = await generateTOTP(secret, period, digits, algoEl.value);
+    otpEl.textContent = otp;
+    // plain mode: output only OTP for direct retrieval / scripting
+    const qs = new URLSearchParams(location.search);
+    if (qs.has('plain')) { document.body.innerHTML = '<pre style="font-size:32px;font-family:monospace">' + otp + '</pre>'; }
+  } catch (e) {
+    otpEl.textContent = '------';
+    errEl.textContent = e.message;
+  }
+}
+
+function tick() {
+  const period = parseInt(periodEl.value, 10) || 30;
+  const now = Math.floor(Date.now() / 1000);
+  const remaining = period - (now % period);
+  cdEl.textContent = remaining + 's remaining';
+  epochEl.textContent = 'step: ' + Math.floor(now / period);
+  barEl.style.width = (remaining / period * 100) + '%';
+  // regenerate exactly on rollover
+  if (remaining === period || remaining === period - 0) { /* noop */ }
+}
+
+// update OTP every second (cheap + guarantees rollover accuracy)
+setInterval(async () => { tick(); const now = Math.floor(Date.now()/1000); const period = parseInt(periodEl.value,10)||30; if (now % period === 0 || otpEl.textContent === '------') await refresh(false); }, 1000);
+
+// ---------- URL params: ?secret_key=XXX / ?secret=XXX / ?key=XXX ----------
+(function initFromURL() {
+  const qs = new URLSearchParams(location.search);
+  const s = qs.get('secret_key') || qs.get('secret') || qs.get('key');
+  if (s) secretEl.value = s.replace(/\s/g, '');
+  if (qs.get('digits') && ['6','8'].includes(qs.get('digits'))) digitsEl.value = qs.get('digits');
+  if (qs.get('period') && ['30','60'].includes(qs.get('period'))) periodEl.value = qs.get('period');
+  if (qs.get('algorithm')) {
+    const a = qs.get('algorithm').toUpperCase().replace('SHA1','SHA-1').replace('SHA256','SHA-256').replace('SHA512','SHA-512');
+    if (['SHA-1','SHA-256','SHA-512'].includes(a)) algoEl.value = a;
+  }
+  if (qs.has('plain')) $('plainNote').style.display = 'inline';
+  $('exampleUrl').textContent = location.origin + location.pathname + '?secret_key=JBSWY3DPEHPK3PXP';
+  refresh(false); tick();
+})();
+
+$('genBtn').addEventListener('click', () => refresh(true));
+$('copyBtn').addEventListener('click', async () => {
+  const t = otpEl.textContent;
+  if (!/^\d+$/.test(t)) return;
+  try { await navigator.clipboard.writeText(t); $('copyBtn').textContent = 'Copied!'; setTimeout(() => $('copyBtn').textContent = 'Copy OTP', 1200); }
+  catch { errEl.textContent = 'Copy failed — select OTP manually.'; }
+});
+// live update while typing
+secretEl.addEventListener('input', () => refresh(false));
+[digitsEl, periodEl, algoEl].forEach(el => el.addEventListener('change', () => refresh(false)));
+</script>
+</body>
+</html>
